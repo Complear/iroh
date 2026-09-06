@@ -100,7 +100,10 @@ pub(crate) mod server {
             metrics: Arc<Metrics>,
         ) -> Result<Self, QuicSpawnError> {
             server_config.alpn_protocols = vec![crate::quic::ALPN_QUIC_ADDR_DISC.to_vec()];
-            let server_config = QuicServerConfig::try_from(server_config)?;
+            let server_config = match crate::quic::initial_suite(server_config.crypto_provider()) {
+                Some(initial) => QuicServerConfig::with_initial(Arc::new(server_config), initial)?,
+                None => QuicServerConfig::try_from(server_config)?,
+            };
             let mut server_config = noq::ServerConfig::with_crypto(Arc::new(server_config));
             let transport_config =
                 Arc::get_mut(&mut server_config.transport).expect("not used yet");
@@ -257,6 +260,41 @@ pub enum Error {
     NoObservedAddr,
 }
 
+/// The cipher suite QUIC v1 protects Initial packets with (RFC 9001 §5.2):
+/// AES-128-GCM under keys HKDF-SHA256 derives from the connection id. Those
+/// keys are derivable by any observer, so this suite protects no application
+/// secret; it is a framing requirement of the protocol, not a negotiated
+/// choice. Supplying it explicitly lets the *negotiated* suite list handed in
+/// through a provider exclude AES-128 — a CNSA 2.0 profile pins
+/// `TLS_AES_256_GCM_SHA384` — without QUIC construction failing.
+///
+/// The provider's own AES-128 suite is preferred when it carries one, which is
+/// exactly what `QuicClientConfig::try_from` does upstream; the backend's suite
+/// is used only when the provider omits it. Complear fork, branch
+/// complear/v1.0.2-cnsa-quic.
+pub fn initial_suite(provider: &rustls::crypto::CryptoProvider) -> Option<rustls::quic::Suite> {
+    let from_provider = provider
+        .cipher_suites
+        .iter()
+        .find_map(|cs| match (cs.suite(), cs.tls13()) {
+            (rustls::CipherSuite::TLS13_AES_128_GCM_SHA256, Some(suite)) => suite.quic_suite(),
+            _ => None,
+        });
+    #[cfg(feature = "tls-aws-lc-rs")]
+    let from_provider = from_provider.or_else(|| {
+        rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256
+            .tls13()
+            .and_then(|suite| suite.quic_suite())
+    });
+    #[cfg(feature = "tls-ring")]
+    let from_provider = from_provider.or_else(|| {
+        rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
+            .tls13()
+            .and_then(|suite| suite.quic_suite())
+    });
+    from_provider
+}
+
 /// Handles the client side of QUIC address discovery.
 #[derive(Debug, Clone)]
 pub struct QuicClient {
@@ -274,9 +312,12 @@ impl QuicClient {
         client_config.alpn_protocols = vec![ALPN_QUIC_ADDR_DISC.into()];
         // go from rustls client config to rustls QUIC specific client config to
         // a noq client config
-        let mut client_config = noq::ClientConfig::new(Arc::new(
-            QuicClientConfig::try_from(client_config).expect("known ciphersuite"),
-        ));
+        let quic_config = match initial_suite(client_config.crypto_provider()) {
+            Some(initial) => QuicClientConfig::with_initial(Arc::new(client_config), initial),
+            None => QuicClientConfig::try_from(client_config),
+        }
+        .expect("known ciphersuite");
+        let mut client_config = noq::ClientConfig::new(Arc::new(quic_config));
 
         // enable the receive side of address discovery
         let mut transport = noq_proto::TransportConfig::default();

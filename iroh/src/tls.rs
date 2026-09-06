@@ -136,40 +136,9 @@ impl TlsConfig {
     }
 }
 
-/// The cipher suite QUIC v1 protects Initial packets with (RFC 9001 §5.2):
-/// AES-128-GCM under keys HKDF-SHA256 derives from the connection id. Those
-/// keys are derivable by any observer, so this suite protects no application
-/// secret; it is a framing requirement of the protocol, not a negotiated
-/// choice. Supplying it explicitly lets the *negotiated* suite list handed in
-/// through `crypto_provider` exclude AES-128 — a CNSA 2.0 profile pins
-/// `TLS_AES_256_GCM_SHA384` — without endpoint construction failing.
-///
-/// The provider's own AES-128 suite is preferred when it carries one, which is
-/// exactly what `QuicClientConfig::try_from` does upstream; the backend's suite
-/// is used only when the provider omits it. Complear fork, branch
-/// complear/v1.0.2-cnsa-quic.
-fn initial_suite(provider: &Arc<rustls::crypto::CryptoProvider>) -> Option<rustls::quic::Suite> {
-    let from_provider = provider
-        .cipher_suites
-        .iter()
-        .find_map(|cs| match (cs.suite(), cs.tls13()) {
-            (rustls::CipherSuite::TLS13_AES_128_GCM_SHA256, Some(suite)) => suite.quic_suite(),
-            _ => None,
-        });
-    #[cfg(feature = "tls-aws-lc-rs")]
-    let from_provider = from_provider.or_else(|| {
-        rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256
-            .tls13()
-            .and_then(|suite| suite.quic_suite())
-    });
-    #[cfg(feature = "tls-ring")]
-    let from_provider = from_provider.or_else(|| {
-        rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
-            .tls13()
-            .and_then(|suite| suite.quic_suite())
-    });
-    from_provider
-}
+/// See [`iroh_relay::quic::initial_suite`]: the RFC 9001 Initial suite,
+/// supplied explicitly so the negotiated suite list can exclude AES-128.
+use iroh_relay::quic::initial_suite;
 
 #[allow(missing_docs)]
 #[n0_error::stack_error(derive, add_meta, from_sources)]
